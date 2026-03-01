@@ -3,23 +3,20 @@
 /// After a market resolves in the user's favour, this module:
 ///   1. Calls `redeemPositions` on the CTF (ConditionalTokens) contract,
 ///      converting winning ERC-1155 position tokens back to USDC.e.
-///   2. Initiates a Circle CCTP transfer to bridge the USDC.e back to Solana.
+///   2. (The return bridge is then initiated from executor.rs via CctpPolygonClient.)
 ///
-/// The CTF `redeemPositions` ABI:
+/// CTF `redeemPositions` ABI:
 ///   redeemPositions(
 ///       address collateralToken,
 ///       bytes32 parentCollectionId,    // 0x000...000 for top-level
 ///       bytes32 conditionId,
-///       uint256[] indexSets            // bitmask per outcome slot
+///       uint256[] indexSets
 ///   )
-/// Function selector: keccak256("redeemPositions(address,bytes32,bytes32,uint256[])")
-///   = 0x8c5d7d37 ... (exact value computed from ABI)
 use crate::{error::{Result, RouterError}, evm::EvmWallet};
 use reqwest::Client as HttpClient;
 use serde_json::json;
 use tracing::info;
 
-/// ABI selector for `redeemPositions`.
 const REDEEM_POSITIONS_SELECTOR: &str = "8c5d7d37";
 
 pub struct SettlementClient {
@@ -35,7 +32,7 @@ impl SettlementClient {
         ctf_address: impl Into<String>,
         executor_private_key: &str,
     ) -> Result<Self> {
-        let wallet = EvmWallet::new(executor_private_key, 137)?; // Polygon mainnet
+        let wallet = EvmWallet::new(executor_private_key, 137)?;
         Ok(SettlementClient {
             polygon_rpc: polygon_rpc.into(),
             ctf_address: ctf_address.into(),
@@ -45,14 +42,6 @@ impl SettlementClient {
     }
 
     /// Redeem winning position tokens on Polygon.
-    ///
-    /// - `collateral_token`: USDC.e address on Polygon.
-    /// - `condition_id`: hex-encoded condition bytes32.
-    /// - `index_sets`: bitmask identifying which outcome slots to redeem.
-    ///   For a YES win on a binary market: `vec![1]` (slot 0 set, slot 1 clear).
-    ///   For a NO win: `vec![2]` (slot 1 set).
-    ///
-    /// Returns the Polygon transaction hash.
     pub async fn redeem_positions(
         &self,
         collateral_token: &str,
@@ -70,15 +59,16 @@ impl SettlementClient {
         Ok(tx_hash)
     }
 
-    /// The executor wallet's Ethereum address.
     pub fn address(&self) -> &str {
         &self.wallet.address
     }
 
-    /// Estimate the USDC.e balance of the executor wallet on Polygon.
+    /// Estimate the USDC.e balance of a given address on Polygon.
     pub async fn usdc_balance(&self, usdc_address: &str, executor_address: &str) -> Result<u64> {
-        // balanceOf(address) selector: 0x70a08231
-        let padded_addr = format!("000000000000000000000000{}", executor_address.trim_start_matches("0x"));
+        let padded_addr = format!(
+            "000000000000000000000000{}",
+            executor_address.trim_start_matches("0x")
+        );
         let calldata = format!("0x70a08231{padded_addr}");
 
         let body = json!({
@@ -105,14 +95,13 @@ impl SettlementClient {
         let bytes = hex::decode(hex.trim_start_matches("0x"))
             .map_err(|e| RouterError::CtfRedeem(e.to_string()))?;
 
-        if bytes.len() < 8 {
-            return Err(RouterError::CtfRedeem("balanceOf result too short".to_string()));
+        if bytes.len() < 32 {
+            return Ok(0);
         }
 
         let balance = u64::from_be_bytes(bytes[24..32].try_into().unwrap_or([0u8; 8]));
         Ok(balance)
     }
-
 }
 
 // ── ABI encoding ──────────────────────────────────────────────────────────────
@@ -122,14 +111,10 @@ fn encode_redeem_positions(
     condition_id: &str,
     index_sets: &[u64],
 ) -> Result<String> {
-    // ABI encoding: (address, bytes32, bytes32, uint256[])
-    // head = 4 words (address, bytes32, bytes32, offset-to-array)
-    // tail = array_len + array_elements
-
     let addr_bytes = pad32_address(collateral_token)?;
     let cid_bytes = bytes32_from_hex(condition_id)?;
-    let parent = [0u8; 32]; // parentCollectionId = 0 for top-level positions
-    let array_offset: u64 = 4 * 32; // 4 head words × 32 bytes each
+    let parent = [0u8; 32];
+    let array_offset: u64 = 4 * 32;
 
     let mut data: Vec<u8> = Vec::new();
     data.extend_from_slice(&addr_bytes);

@@ -7,7 +7,6 @@ pub struct RouterConfig {
     pub solana_rpc_url: String,
     pub solana_keypair_path: String,
     pub jupiter_api_url: String,
-    /// Slippage tolerance for Jupiter swaps, in basis points.
     pub jupiter_slippage_bps: u16,
 
     // ── CCTP Bridge ───────────────────────────────────────────────────────────
@@ -15,7 +14,6 @@ pub struct RouterConfig {
     pub cctp_solana_token_messenger: String,
     pub cctp_polygon_message_transmitter: String,
     pub cctp_polygon_token_messenger: String,
-    /// How long to poll for CCTP attestation before erroring.
     pub cctp_attestation_timeout_secs: u64,
 
     // ── Polygon / EVM ─────────────────────────────────────────────────────────
@@ -28,19 +26,25 @@ pub struct RouterConfig {
 
     // ── Polymarket CLOB API ───────────────────────────────────────────────────
     pub poly_clob_url: String,
-    pub poly_api_key: String,
-    pub poly_secret: String,
-    pub poly_passphrase: String,
+    /// EVM private key (0x-prefixed) used to sign Polymarket CLOB orders.
+    /// This is the L1 signing key submitted via the CLOB auth flow.
+    /// (Previously called POLY_SECRET in old SDK flows; POLY_API_KEY and
+    ///  POLY_PASSPHRASE are no longer used with the official SDK.)
+    pub poly_private_key: String,
 
     // ── Protocol ──────────────────────────────────────────────────────────────
-    /// Protocol fee in basis points, deducted from the USDC amount before bridging.
     pub protocol_fee_bps: u16,
-    /// Maximum single-order value in USDC (in micro-USDC: 1 USDC = 1_000_000).
     pub max_order_usdc_micro: u64,
-    /// How long to wait for a Polymarket order to be filled before cancelling.
     pub poly_order_fill_timeout_secs: u64,
-    /// Path for JSON order persistence (None → in-memory only).
     pub order_store_path: Option<String>,
+
+    // ── Production safety ─────────────────────────────────────────────────────
+    /// Allowed Polymarket condition IDs.  None = all markets allowed.
+    pub allowed_market_ids: Option<Vec<String>>,
+    /// Maximum USDC bridged per rolling 24-hour window (micro-USDC, 0 = no cap).
+    pub daily_volume_cap_usdc_micro: u64,
+    /// Pause new order processing after this many consecutive executor failures (0 = never pause).
+    pub circuit_breaker_failure_threshold: u32,
 }
 
 impl RouterConfig {
@@ -65,6 +69,22 @@ impl RouterConfig {
             let v = get_or(key, &default.to_string());
             v.parse::<u64>().map_err(|_| RouterError::Config(format!("{key} must be a u64")))
         };
+
+        let parse_u32 = |key: &str, default: u32| -> Result<u32> {
+            let v = get_or(key, &default.to_string());
+            v.parse::<u32>().map_err(|_| RouterError::Config(format!("{key} must be a u32")))
+        };
+
+        // POLY_EVM_PRIVATE_KEY is the canonical name; fall back to the old POLY_SECRET for migration.
+        let poly_private_key = std::env::var("POLY_EVM_PRIVATE_KEY")
+            .or_else(|_| std::env::var("POLY_SECRET"))
+            .unwrap_or_default();
+
+        // Market ID whitelist: comma-separated list of condition IDs, or empty for all.
+        let allowed_market_ids = std::env::var("ALLOWED_MARKET_IDS")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(',').map(|id| id.trim().to_string()).collect());
 
         Ok(RouterConfig {
             solana_rpc_url: get_or("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"),
@@ -103,14 +123,16 @@ impl RouterConfig {
             ),
 
             poly_clob_url: get_or("POLY_CLOB_URL", "https://clob.polymarket.com"),
-            poly_api_key: get_or("POLY_API_KEY", ""),
-            poly_secret: get_or("POLY_SECRET", ""),
-            poly_passphrase: get_or("POLY_PASSPHRASE", ""),
+            poly_private_key,
 
             protocol_fee_bps: parse_u16("PROTOCOL_FEE_BPS", 30)?,
             max_order_usdc_micro: parse_u64("MAX_ORDER_USDC", 1000)? * 1_000_000,
             poly_order_fill_timeout_secs: parse_u64("POLY_ORDER_FILL_TIMEOUT_SECS", 120)?,
             order_store_path: std::env::var("ORDER_STORE_PATH").ok().filter(|s| !s.is_empty()),
+
+            allowed_market_ids,
+            daily_volume_cap_usdc_micro: parse_u64("DAILY_VOLUME_CAP_USDC", 0)? * 1_000_000,
+            circuit_breaker_failure_threshold: parse_u32("CIRCUIT_BREAKER_FAILURES", 5)?,
         })
     }
 }
@@ -120,6 +142,9 @@ pub const USDC_SOLANA_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 
 /// CCTP destination domain ID for Polygon PoS.
 pub const CCTP_POLYGON_DOMAIN: u32 = 7;
+
+/// CCTP source domain ID for Solana.
+pub const CCTP_SOLANA_DOMAIN: u32 = 5;
 
 /// USDC decimals (both Solana and Polygon).
 pub const USDC_DECIMALS: u8 = 6;

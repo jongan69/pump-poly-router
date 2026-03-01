@@ -1,7 +1,8 @@
 /// Polymarket order placement wrapper — official polymarket-client-sdk 0.4.
 ///
-/// Authenticates a fresh CLOB client per `buy_position()` call (avoids
-/// storing the generic `Client<Authenticated<K>>` in a struct field).
+/// `post_order()` posts a market buy and returns the order ID immediately.
+/// `wait_for_fill()` polls until the order fills or timeout elapses.
+/// `buy_position()` combines both for the common case.
 use crate::{
     error::{Result, RouterError},
     types::Outcome,
@@ -21,15 +22,12 @@ use tracing::{debug, info};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderResult {
     pub order_id: String,
-    /// Number of shares received.
     pub shares_filled: f64,
-    /// Average fill price (0–1).
     pub avg_price: f64,
 }
 
 pub struct PolymarketOrderClient {
     clob_url: String,
-    /// Hex private key used for L1 order signing and L2 API authentication.
     private_key_hex: String,
     fill_timeout_secs: u64,
 }
@@ -43,20 +41,16 @@ impl PolymarketOrderClient {
         }
     }
 
-    /// Place a market buy order for the given outcome token.
+    /// Post a market buy order and return the order ID immediately.
     ///
-    /// - `token_id`: ERC-1155 position token ID.
-    /// - `usdc_amount`: amount in **micro-USDC** (6 decimals).
-    /// - `outcome`: for logging only.
-    ///
-    /// Authenticates a fresh CLOB session, posts the order, then polls
-    /// until filled or `fill_timeout_secs` elapses.
-    pub async fn buy_position(
+    /// Does NOT wait for the order to fill.  Call `wait_for_fill()` to poll
+    /// until the order is matched.
+    pub async fn post_order(
         &self,
         token_id: &str,
         usdc_amount: u64,
         outcome: Outcome,
-    ) -> Result<OrderResult> {
+    ) -> Result<String> {
         let signer = PrivateKeySigner::from_str(&self.private_key_hex)
             .map_err(|e| RouterError::PolyOrderPost(e.to_string()))?;
 
@@ -67,11 +61,8 @@ impl PolymarketOrderClient {
             .await
             .map_err(|e| RouterError::PolyOrderPost(e.to_string()))?;
 
-        // Convert micro-USDC (6 decimal places) to rust_decimal::Decimal
-        // e.g. 1_500_000 µUSDC → Decimal::new(1_500_000, 6) → 1.500000 USDC
         let usdc_decimal = Decimal::new(usdc_amount as i64, 6);
 
-        // Parse token_id: Polymarket token IDs are U256 integers (decimal string)
         let token_u256 = U256::from_str_radix(token_id.trim_start_matches("0x"), 16)
             .or_else(|_| token_id.parse::<U256>())
             .map_err(|_| RouterError::PolyOrderPost(format!("invalid token_id: {token_id}")))?;
@@ -109,16 +100,32 @@ impl PolymarketOrderClient {
 
         let order_id = post_resp.order_id.to_string();
         info!("Polymarket order posted: {order_id}");
+        Ok(order_id)
+    }
 
-        // Poll until filled
+    /// Poll the CLOB for an order's fill status.
+    ///
+    /// Blocks until the order is filled or `fill_timeout_secs` elapses.
+    /// Returns `OrderResult` on fill, or `RouterError::PolyFillTimeout` on timeout.
+    pub async fn wait_for_fill(&self, order_id: &str) -> Result<OrderResult> {
+        let signer = PrivateKeySigner::from_str(&self.private_key_hex)
+            .map_err(|e| RouterError::PolyOrderPost(e.to_string()))?;
+
+        let client = Client::new(&self.clob_url, Config::default())
+            .map_err(|e| RouterError::PolyOrderPost(e.to_string()))?
+            .authentication_builder(&signer)
+            .authenticate()
+            .await
+            .map_err(|e| RouterError::PolyOrderPost(e.to_string()))?;
+
         let deadline = Instant::now() + Duration::from_secs(self.fill_timeout_secs);
+
         loop {
             let resp = client
-                .order(&order_id)
+                .order(order_id)
                 .await
                 .map_err(|e| RouterError::PolyOrderPost(e.to_string()))?;
 
-            // Inspect status via debug representation until we know the exact enum variants
             let status = format!("{:?}", resp.status);
             debug!("order {order_id} status: {status}");
 
@@ -128,22 +135,32 @@ impl PolymarketOrderClient {
 
                 info!("Order {order_id} filled: {shares} shares @ {price}");
                 return Ok(OrderResult {
-                    order_id,
+                    order_id: order_id.to_string(),
                     shares_filled: shares,
                     avg_price: price,
                 });
             }
 
             if Instant::now() >= deadline {
-                // Best-effort cancel to free collateral
-                let _ = client.cancel_order(&order_id).await;
+                let _ = client.cancel_order(order_id).await;
                 return Err(RouterError::PolyFillTimeout {
                     secs: self.fill_timeout_secs,
-                    order_id,
+                    order_id: order_id.to_string(),
                 });
             }
 
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
+    }
+
+    /// Convenience: post and wait for fill in one call.
+    pub async fn buy_position(
+        &self,
+        token_id: &str,
+        usdc_amount: u64,
+        outcome: Outcome,
+    ) -> Result<OrderResult> {
+        let order_id = self.post_order(token_id, usdc_amount, outcome).await?;
+        self.wait_for_fill(&order_id).await
     }
 }
