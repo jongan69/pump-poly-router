@@ -13,18 +13,20 @@ name = "route_trade"
 required-features = []
 
 [dependencies]
-# Local Polymarket SDK
-polymarket-client-sdk = { path = "../PolyRust/polymarket-client-sdk", features = ["clob", "ws"] }
+# Official Polymarket CLOB SDK (replaces local path dep)
+polymarket-client-sdk = { version = "0.4", features = ["clob"] }
+# Pin alloy to 1.6.x — 1.7+ bumped MSRV to Rust 1.91; polymarket SDK specifies ^1.6.3
+alloy = ">=1.6.3, <1.7"
 
-# Solana
-solana-sdk = "1.18"
-solana-client = "1.18"
-spl-token = { version = "4.0", features = ["no-entrypoint"] }
-spl-associated-token-account = { version = "2.0", features = ["no-entrypoint"] }
+# Solana (upgraded from 1.18 → 2.1 to unblock alloy/zeroize constraint)
+solana-sdk = "2.1"
+solana-client = "2.1"
+spl-token = { version = "7.0", features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "4.0", features = ["no-entrypoint"] }
 
 # Async runtime + HTTP
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -35,15 +37,17 @@ borsh = { version = "1.0", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 anyhow = "1.0"
 thiserror = "1.0"
-base64 = "0.21"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 hex = "0.4"
+rust_decimal = "1"
 bincode = "1.3"
 shellexpand = "3.1"
-# EVM signing — use libsecp256k1 already pulled in by solana-sdk (avoids zeroize conflict)
+# EVM signing — libsecp256k1 0.6 (zeroize ^1.3) and alloy (zeroize ^1.8) both
+# resolve to zeroize 1.8.x; no conflict because solana-sdk 2.x removed the <1.4 pin
 libsecp256k1 = "0.6"
 sha3 = "0.10"
 

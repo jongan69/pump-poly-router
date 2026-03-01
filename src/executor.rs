@@ -29,10 +29,6 @@ use crate::{
     store::OrderStore,
     types::{OrderIntent, OrderStatus, Outcome},
 };
-use polymarket_client_sdk::{
-    auth::LocalSigner,
-    clob::{Client as ClobClient, Config as ClobConfig},
-};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{pubkey::Pubkey, signature::read_keypair_file, signer::Signer};
 use std::str::FromStr;
@@ -69,12 +65,12 @@ impl TradeRouter {
 
         let attestation = CircleAttestationClient::new(&config.cctp_attestation_url);
 
-        // Build the Polymarket CLOB client with credentials from config.
-        let clob_config = ClobConfig::builder().use_server_time(false).build();
-        let clob = ClobClient::new(&config.poly_clob_url, clob_config)
-            .map_err(|e| RouterError::Config(e.to_string()))?;
-        let signer = LocalSigner::from_secret(&config.poly_secret);
-        let poly_client = PolymarketOrderClient::new(clob, signer, config.poly_order_fill_timeout_secs);
+        // Build the Polymarket CLOB client (authenticates lazily per order).
+        let poly_client = PolymarketOrderClient::new(
+            &config.poly_clob_url,
+            &config.poly_secret,
+            config.poly_order_fill_timeout_secs,
+        );
 
         let resolver = ConditionResolver::new(&config.polygon_rpc_url, &config.ctf_contract_address);
 
